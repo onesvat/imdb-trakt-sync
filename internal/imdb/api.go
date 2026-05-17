@@ -199,7 +199,7 @@ func (c *client) hydrate() error {
 	if err != nil {
 		return fmt.Errorf("failure navigating and validating response: %w", err)
 	}
-	hyperlink, err := tab.Element(`[data-testid="SidebarList-title-your"] a[href*='/user/ur']`)
+	hyperlink, err := tab.Element(`a[href*='/user/ur'][href*='/watchlist']`)
 	if err != nil {
 		return fmt.Errorf("failure finding sidebar hyperlink element: %w", err)
 	}
@@ -555,6 +555,9 @@ func (c *client) lidsScrape() ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failure parsing list count string to integer: %w", err)
 	}
+	if listCount == 0 {
+		return make([]string, 0), nil
+	}
 	if err = c.scrollUntilAllElementsVisible(tab, "a.ipc-metadata-list-summary-item__t", listCount); err != nil {
 		return nil, fmt.Errorf("failure scrolling until all list elements are visible: %w", err)
 	}
@@ -578,6 +581,9 @@ func (c *client) lidsScrape() ([]string, error) {
 }
 
 func (c *client) scrollUntilAllElementsVisible(tab *rod.Page, selector string, count int) error {
+	if count == 0 {
+		return nil
+	}
 	elements, err := tab.Elements(selector)
 	if err != nil {
 		return fmt.Errorf("failure finding elements: %w", err)
