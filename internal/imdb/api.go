@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -40,6 +42,10 @@ const (
 	pathRatings   = "/user/%s/ratings"
 	pathSignIn    = "/registration/ap-signin-handler/imdb_us"
 	pathWatchlist = "/list/watchlist"
+
+	// ratingsExportToken is the href fragment used to locate the ratings export
+	// resource on the /exports page, independent of the user id format.
+	ratingsExportToken = "/ratings"
 
 	selectorErrorPageTitle     = "h1[data-testid='error-page-title']"
 	selectorExportButton       = "div[data-testid='hero-list-subnav-export-button'] button"
@@ -199,24 +205,22 @@ func (c *client) hydrate() error {
 	if err != nil {
 		return fmt.Errorf("failure navigating and validating response: %w", err)
 	}
-	hyperlink, err := tab.Element(`a[href*='/user/ur'][href*='/watchlist']`)
+	// Navigating to the watchlist redirects to /user/{userID}/watchlist/, so the
+	// authenticated user id can be extracted directly from the resulting URL.
+	info, err := tab.Info()
 	if err != nil {
-		return fmt.Errorf("failure finding sidebar hyperlink element: %w", err)
+		return fmt.Errorf("failure retrieving watchlist page info: %w", err)
 	}
-	href, err := hyperlink.Attribute("href")
+	userID, err := userIDExtract(info.URL)
 	if err != nil {
-		return fmt.Errorf("failure extracting href from sidebar hyperlink: %w", err)
-	}
-	userID, err := idExtract(*href)
-	if err != nil {
-		return fmt.Errorf("failure extracting user id from href: %w", err)
+		return fmt.Errorf("failure extracting user id from watchlist url: %w", err)
 	}
 	c.userID = userID
-	hyperlink, err = tab.Element("a[data-testid='hero-list-subnav-edit-button']")
+	hyperlink, err := tab.Element("a[data-testid='hero-list-subnav-edit-button']")
 	if err != nil {
 		return fmt.Errorf("failure finding edit button hyperlink element: %w", err)
 	}
-	href, err = hyperlink.Attribute("href")
+	href, err := hyperlink.Attribute("href")
 	if err != nil {
 		return fmt.Errorf("failure extracting href from edit button hyperlink: %w", err)
 	}
@@ -347,15 +351,35 @@ func (c *client) RatingsGet() (Items, error) {
 	if c.skipRatingsDownload {
 		return nil, nil
 	}
-	resources, err := c.getExportedResources(c.userID)
+	resources, err := c.getExportedResources(ratingsExportToken)
 	if err != nil {
 		return nil, fmt.Errorf("failure fetching exported resources: %w", err)
 	}
-	filteredResources, err := c.filterResources(resources, c.userID)
+	resource, err := c.filterRatingsResource(resources)
 	if err != nil {
-		return nil, fmt.Errorf("failure filtering resources: %w", err)
+		return nil, fmt.Errorf("failure filtering ratings resource: %w", err)
 	}
-	return c.ratingsDownload(filteredResources[0])
+	return c.ratingsDownload(resource)
+}
+
+// filterRatingsResource returns the most recent ratings export resource. IMDb
+// labels these with a /user/{id}/ratings hyperlink whose id format may differ
+// from the one used elsewhere, so it is matched by shape via isRatingsHyperlink.
+func (c *client) filterRatingsResource(resources rod.Elements) (*rod.Element, error) {
+	for _, r := range resources {
+		hyperlink, err := r.Element("a.ipc-metadata-list-summary-item__t")
+		if err != nil {
+			return nil, fmt.Errorf("failure finding resource hyperlink: %w", err)
+		}
+		href, err := hyperlink.Attribute("href")
+		if err != nil {
+			return nil, fmt.Errorf("failure extracting href from resource hyperlink: %w", err)
+		}
+		if isRatingsHyperlink(*href) {
+			return r, nil
+		}
+	}
+	return nil, fmt.Errorf("ratings export resource not found")
 }
 
 func (c *client) ratingsDownload(resource *rod.Element) (Items, error) {
@@ -521,9 +545,6 @@ func (c *client) filterResources(resources rod.Elements, ids ...string) (rod.Ele
 				filteredResources = append(filteredResources, r)
 			}
 		}
-		if isRatingsHyperlink(*href, c.userID) {
-			return rod.Elements{r}, nil
-		}
 	}
 	if len(filteredResources) != len(ids) {
 		return nil, fmt.Errorf("expected the number of filtered resources to be %d, but got %d", len(ids), len(filteredResources))
@@ -662,9 +683,14 @@ func isListHyperlink(href string) bool {
 	return strings.HasPrefix(href, "/list/ls")
 }
 
-func isRatingsHyperlink(href, userID string) bool {
-	prefix := fmt.Sprintf("/user/%s/ratings", userID)
-	return strings.HasPrefix(href, prefix)
+// ratingsHrefRegex matches the ratings export hyperlink, e.g.
+// /user/ur36148206/ratings/ or /user/p.abc/ratings/. IMDb is inconsistent about
+// the user id format across pages, so the resource is matched by shape rather
+// than by a specific user id.
+var ratingsHrefRegex = regexp.MustCompile(`^/user/[^/]+/ratings`)
+
+func isRatingsHyperlink(href string) bool {
+	return ratingsHrefRegex.MatchString(href)
 }
 
 func isPeopleList(header []string) bool {
@@ -794,6 +820,22 @@ func idExtract(href string) (string, error) {
 		return "", fmt.Errorf("hyperlink href has unexpected format: %s", href)
 	}
 	return pieces[2], nil
+}
+
+// userIDExtract returns the imdb user id from a url whose path contains a
+// /user/{userID} segment, e.g. https://www.imdb.com/user/p.abc/watchlist/.
+func userIDExtract(rawURL string) (string, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return "", fmt.Errorf("failure parsing url %s: %w", rawURL, err)
+	}
+	pieces := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	for i, piece := range pieces {
+		if piece == "user" && i+1 < len(pieces) && pieces[i+1] != "" {
+			return pieces[i+1], nil
+		}
+	}
+	return "", fmt.Errorf("url does not contain a user id: %s", rawURL)
 }
 
 func buildSelector(ids ...string) string {
