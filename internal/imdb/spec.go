@@ -69,3 +69,21 @@ type List struct {
 }
 
 type Lists []List
+
+type NextData struct {
+	Props Props `json:"props"`
+}
+
+type Props struct {
+	PageProps PageProps `json:"pageProps"`
+}
+
+type PageProps struct {
+	AboveTheFoldData AboveTheFoldData `json:"aboveTheFoldData"`
+}
+
+type AboveTheFoldData struct {
+	AuthorID        string `json:"authorId"`
+	AuthorProfileID string `json:"authorProfileId"`
+	ListID          string `json:"listId"`
+}

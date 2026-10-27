@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 
@@ -30,6 +31,13 @@ const (
 	pathUserLists           = "/users/%s/lists"
 	pathWatchlist           = "/sync/watchlist"
 	pathWatchlistRemove     = "/sync/watchlist/remove"
+
+	// bulkRequestChunkSize bounds how many items are sent to trakt in a
+	// single sync request. Trakt's bulk endpoints have been observed to
+	// respond with repeated server errors when a single request carries a
+	// very large payload (thousands of items), so large item sets are split
+	// into multiple requests instead of being sent in one shot.
+	bulkRequestChunkSize = 200
 )
 
 type client struct {
@@ -43,11 +51,11 @@ type API interface {
 	HistoryAdd(ctx context.Context, its Items) error
 	HistoryGet(ctx context.Context, itType, itID string) (Items, error)
 	HistoryRemove(ctx context.Context, its Items) error
-	ListAdd(ctx context.Context, name string) (*IDMeta, error)
+	ListCreate(ctx context.Context, name string) (*IDMeta, error)
 	ListGet(ctx context.Context, lid int) (*List, error)
 	ListGetMeta(ctx context.Context, lid int) (*List, error)
-	ListItemsAdd(ctx context.Context, lid int, its Items) error
-	ListItemsRemove(ctx context.Context, lid int, its Items) error
+	ListItemsAdd(ctx context.Context, lid int, name string, its Items) error
+	ListItemsRemove(ctx context.Context, lid int, name string, its Items) error
 	ListsGet(ctx context.Context, ids IDMetas) (Lists, error)
 	ListsGetAllMeta(ctx context.Context) (Lists, error)
 	RatingsAdd(ctx context.Context, its Items) error
@@ -63,8 +71,9 @@ func NewAPI(ctx context.Context, conf config.Trakt, logger *slog.Logger) (API, e
 	transport := newAuthTransport(
 		retryTrans,
 		newAuthClient(conf, retryTrans),
-		NewBrowser(conf, retryTrans),
 		*conf.ClientID,
+		*conf.TokenFile,
+		logger,
 	)
 	c := &client{
 		baseURL: pathBaseAPI,
@@ -81,29 +90,41 @@ func NewAPI(ctx context.Context, conf config.Trakt, logger *slog.Logger) (API, e
 	return c, nil
 }
 
+// postItemsChunked splits its into chunks of at most bulkRequestChunkSize
+// and POSTs each chunk to path in turn, merging the per-chunk responses into
+// a single result so callers can log/handle it as if it were one request.
+func (c *client) postItemsChunked(ctx context.Context, path string, its Items, statusCode int) (response, error) {
+	merged := response{}
+	for chunk := range slices.Chunk(its, bulkRequestChunkSize) {
+		b, err := json.Marshal(chunk.toListBody())
+		if err != nil {
+			return response{}, fmt.Errorf("failure marshaling items: %w", err)
+		}
+		resp, err := doRequest(ctx, c.httpClient, http.MethodPost, c.baseURL, path, nil, bytes.NewReader(b), nil, statusCode)
+		if err != nil {
+			return response{}, fmt.Errorf("failure doing request: %w", err)
+		}
+		r, err := decodeJSON[response](resp.Body)
+		if err != nil {
+			return response{}, fmt.Errorf("failure decoding response: %w", err)
+		}
+		merged.merge(r)
+	}
+	return merged, nil
+}
+
 func (c *client) HistoryAdd(ctx context.Context, its Items) error {
-	b, err := json.Marshal(its.toListBody())
+	h, err := c.postItemsChunked(ctx, pathHistory, its, http.StatusCreated)
 	if err != nil {
 		return err
 	}
-	body := bytes.NewReader(b)
-	resp, err := doRequest(ctx, c.httpClient, http.MethodPost, c.baseURL, pathHistory, nil, body, nil, http.StatusCreated)
-	if err != nil {
-		return fmt.Errorf("failure doing request: %w", err)
-	}
-	h, err := decodeJSON[response](resp.Body)
-	if err != nil {
-		return fmt.Errorf("failure decoding history response: %w", err)
-	}
-	c.logger.Info("synced trakt history", slog.Any("history", h))
+	c.logger.Info("added trakt history", "items", h)
 	return nil
 }
 
 func (c *client) HistoryGet(ctx context.Context, itType, itID string) (Items, error) {
 	path := fmt.Sprintf(pathHistoryGet, itType+"s", itID)
-	query := map[string][]string{
-		"limit": {"1000"},
-	}
+	query := map[string][]string{"limit": {"1000"}}
 	resp, err := doRequest(ctx, c.httpClient, http.MethodGet, c.baseURL, path, query, http.NoBody, nil, http.StatusOK, http.StatusNotFound)
 	if err != nil {
 		return nil, fmt.Errorf("failure doing request: %w", err)
@@ -116,25 +137,15 @@ func (c *client) HistoryGet(ctx context.Context, itType, itID string) (Items, er
 }
 
 func (c *client) HistoryRemove(ctx context.Context, its Items) error {
-	b, err := json.Marshal(its.toListBody())
+	h, err := c.postItemsChunked(ctx, pathHistoryRemove, its, http.StatusOK)
 	if err != nil {
 		return err
 	}
-	body := bytes.NewReader(b)
-	resp, err := doRequest(ctx, c.httpClient, http.MethodPost, c.baseURL, pathHistoryRemove, nil, body, nil, http.StatusOK)
-	if err != nil {
-		return fmt.Errorf("failure doing request: %w", err)
-	}
-	defer resp.Body.Close()
-	h, err := decodeJSON[response](resp.Body)
-	if err != nil {
-		return fmt.Errorf("failure decoding history response: %w", err)
-	}
-	c.logger.Info("synced trakt history", slog.Any("history", h))
+	c.logger.Info("removed trakt history", "items", h)
 	return nil
 }
 
-func (c *client) ListAdd(ctx context.Context, name string) (*IDMeta, error) {
+func (c *client) ListCreate(ctx context.Context, name string) (*IDMeta, error) {
 	b, err := json.Marshal(listAddBody{
 		Name:        name,
 		Description: fmt.Sprintf("List imported from IMDb using https://github.com/cecobask/imdb-trakt-sync on %v", time.Now().Format(time.RFC1123)),
@@ -154,7 +165,7 @@ func (c *client) ListAdd(ctx context.Context, name string) (*IDMeta, error) {
 		return nil, fmt.Errorf("failure decoding list response: %w", err)
 	}
 
-	c.logger.Info("created trakt list", "name", name, "id", list.IDMeta.Trakt)
+	c.logger.Info("created trakt list", "name", name, "id", list.IDMeta.Trakt, "slug", list.IDMeta.Slug)
 	return &list.IDMeta, nil
 }
 
@@ -192,41 +203,23 @@ func (c *client) ListGetMeta(ctx context.Context, lid int) (*List, error) {
 	return &list, nil
 }
 
-func (c *client) ListItemsAdd(ctx context.Context, lid int, its Items) error {
-	b, err := json.Marshal(its.toListBody())
-	if err != nil {
-		return fmt.Errorf("failure marshaling list items: %w", err)
-	}
-	body := bytes.NewReader(b)
+func (c *client) ListItemsAdd(ctx context.Context, lid int, name string, its Items) error {
 	path := fmt.Sprintf(pathUserListItems, c.username, lid)
-	resp, err := doRequest(ctx, c.httpClient, http.MethodPost, c.baseURL, path, nil, body, nil, http.StatusCreated)
+	l, err := c.postItemsChunked(ctx, path, its, http.StatusCreated)
 	if err != nil {
-		return fmt.Errorf("failure doing request: %w", err)
+		return err
 	}
-	l, err := decodeJSON[response](resp.Body)
-	if err != nil {
-		return fmt.Errorf("failure decoding list items response: %w", err)
-	}
-	c.logger.Info("synced trakt list", slog.Any("items", l))
+	c.logger.Info("added trakt list items", "name", name, "items", l)
 	return nil
 }
 
-func (c *client) ListItemsRemove(ctx context.Context, lid int, its Items) error {
-	b, err := json.Marshal(its.toListBody())
-	if err != nil {
-		return fmt.Errorf("failure marshaling list items: %w", err)
-	}
-	body := bytes.NewReader(b)
+func (c *client) ListItemsRemove(ctx context.Context, lid int, name string, its Items) error {
 	path := fmt.Sprintf(pathUserListItemsRemove, c.username, lid)
-	resp, err := doRequest(ctx, c.httpClient, http.MethodPost, c.baseURL, path, nil, body, nil, http.StatusOK)
+	l, err := c.postItemsChunked(ctx, path, its, http.StatusOK)
 	if err != nil {
-		return fmt.Errorf("failure doing request: %w", err)
+		return err
 	}
-	l, err := decodeJSON[response](resp.Body)
-	if err != nil {
-		return fmt.Errorf("failure decoding list items response: %w", err)
-	}
-	c.logger.Info("synced trakt list", slog.Any("items", l))
+	c.logger.Info("removed trakt list items", "name", name, "items", l)
 	return nil
 }
 
@@ -277,26 +270,21 @@ func (c *client) ListsGetAllMeta(ctx context.Context) (Lists, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failure decoding lists response: %w", err)
 	}
-	c.logger.Info("fetched existing trakt lists metadata", "count", len(lists))
+	listNames := make([]string, 0, len(lists))
+	for _, list := range lists {
+		listNames = append(listNames, *list.Name)
+	}
+	c.logger.Info("fetched existing trakt lists metadata", "count", len(lists), "names", listNames)
 
 	return lists, nil
 }
 
 func (c *client) RatingsAdd(ctx context.Context, its Items) error {
-	b, err := json.Marshal(its.toListBody())
+	r, err := c.postItemsChunked(ctx, pathRatings, its, http.StatusCreated)
 	if err != nil {
 		return err
 	}
-	body := bytes.NewReader(b)
-	resp, err := doRequest(ctx, c.httpClient, http.MethodPost, c.baseURL, pathRatings, nil, body, nil, http.StatusCreated)
-	if err != nil {
-		return fmt.Errorf("failure doing request: %w", err)
-	}
-	r, err := decodeJSON[response](resp.Body)
-	if err != nil {
-		return fmt.Errorf("failure decoding ratings response: %w", err)
-	}
-	c.logger.Info("synced trakt ratings", slog.Any("ratings", r))
+	c.logger.Info("added trakt ratings", "items", r)
 	return nil
 }
 
@@ -313,20 +301,11 @@ func (c *client) RatingsGet(ctx context.Context) (Items, error) {
 }
 
 func (c *client) RatingsRemove(ctx context.Context, its Items) error {
-	b, err := json.Marshal(its.toListBody())
+	r, err := c.postItemsChunked(ctx, pathRatingsRemove, its, http.StatusOK)
 	if err != nil {
-		return fmt.Errorf("failure marshaling ratings items: %w", err)
+		return err
 	}
-	body := bytes.NewReader(b)
-	resp, err := doRequest(ctx, c.httpClient, http.MethodPost, c.baseURL, pathRatingsRemove, nil, body, nil, http.StatusOK)
-	if err != nil {
-		return fmt.Errorf("failure doing request: %w", err)
-	}
-	r, err := decodeJSON[response](resp.Body)
-	if err != nil {
-		return fmt.Errorf("failure decoding ratings response: %w", err)
-	}
-	c.logger.Info("synced trakt ratings", slog.Any("ratings", r))
+	c.logger.Info("removed trakt ratings", "items", r)
 	return nil
 }
 
@@ -349,38 +328,20 @@ func (c *client) WatchlistGet(ctx context.Context) (*List, error) {
 }
 
 func (c *client) WatchlistItemsAdd(ctx context.Context, its Items) error {
-	b, err := json.Marshal(its.toListBody())
+	w, err := c.postItemsChunked(ctx, pathWatchlist, its, http.StatusCreated)
 	if err != nil {
-		return fmt.Errorf("failure marshaling watchlist items: %w", err)
+		return err
 	}
-	body := bytes.NewReader(b)
-	resp, err := doRequest(ctx, c.httpClient, http.MethodPost, c.baseURL, pathWatchlist, nil, body, nil, http.StatusCreated)
-	if err != nil {
-		return fmt.Errorf("failure doing request: %w", err)
-	}
-	w, err := decodeJSON[response](resp.Body)
-	if err != nil {
-		return fmt.Errorf("failure decoding watchlist response: %w", err)
-	}
-	c.logger.Info("synced trakt watchlist", slog.Any("watchlist", w))
+	c.logger.Info("added trakt watchlist items", "items", w)
 	return nil
 }
 
 func (c *client) WatchlistItemsRemove(ctx context.Context, its Items) error {
-	b, err := json.Marshal(its.toListBody())
+	w, err := c.postItemsChunked(ctx, pathWatchlistRemove, its, http.StatusOK)
 	if err != nil {
-		return fmt.Errorf("failure marshaling watchlist items: %w", err)
+		return err
 	}
-	body := bytes.NewReader(b)
-	resp, err := doRequest(ctx, c.httpClient, http.MethodPost, c.baseURL, pathWatchlistRemove, nil, body, nil, http.StatusOK)
-	if err != nil {
-		return fmt.Errorf("failure doing request: %w", err)
-	}
-	w, err := decodeJSON[response](resp.Body)
-	if err != nil {
-		return fmt.Errorf("failure decoding watchlist response: %w", err)
-	}
-	c.logger.Info("synced trakt watchlist", slog.Any("watchlist", w))
+	c.logger.Info("removed trakt watchlist items", "items", w)
 	return nil
 }
 
