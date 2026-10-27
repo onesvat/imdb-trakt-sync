@@ -37,6 +37,7 @@ type authTokensBody struct {
 	ClientSecret string `json:"client_secret"`
 	RefreshToken string `json:"refresh_token,omitempty"`
 	GrantType    string `json:"grant_type"`
+	RedirectURI  string `json:"redirect_uri,omitempty"`
 }
 
 type authTokensResponse struct {
@@ -115,13 +116,14 @@ func (ac *authClient) getAccessToken(ctx context.Context, grantType, secret stri
 		atb.Code = secret
 	} else {
 		atb.RefreshToken = secret
+		atb.RedirectURI = "urn:ietf:wg:oauth:2.0:oob"
 	}
 	b, err := json.Marshal(atb)
 	if err != nil {
 		return nil, fmt.Errorf("failure marshaling auth tokens body: %w", err)
 	}
 	body := bytes.NewReader(b)
-	resp, err := doRequest(ctx, ac.client, http.MethodPost, ac.baseURL, pathAuthTokens, nil, body, nil, http.StatusOK)
+	resp, err := doRequest(ctx, ac.client, http.MethodPost, ac.baseURL, pathAuthRefreshTokens, nil, body, nil, http.StatusOK)
 	if err != nil {
 		return nil, err
 	}
